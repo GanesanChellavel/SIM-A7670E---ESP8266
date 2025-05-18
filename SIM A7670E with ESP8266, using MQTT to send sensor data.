@@ -1,0 +1,148 @@
+//Working code for SIM A7670E with ESP8266, using MQTT to send sensor Dummy data. M2M IoT simcard
+
+#include <SoftwareSerial.h>
+
+// ---------- Configuration ----------
+SoftwareSerial gsmSerial(5, 4); // D1 = RX, D2 = TX on ESP8266
+
+const char* apn = "stmiot"; // Your APN
+
+// MQTT broker settings
+const char* mqttServer = ".............................";
+const int mqttPort = 1883;
+const char* mqttUser = "aws";
+const char* mqttPassword = "aws@1234";
+const char* mqttClientID = "ESP8266-A7670E";
+const char* mqttTopic = "sal/aws/555555";
+
+unsigned long interval = 5UL * 60UL * 1000UL; // 5 minutes
+// -----------------------------------
+
+void sendAT(const char* cmd, const char* expected, unsigned long timeout = 3000) {
+  gsmSerial.println(cmd);
+  unsigned long start = millis();
+  while (millis() - start < timeout) {
+    if (gsmSerial.find(const_cast<char*>(expected))) {
+      Serial.println(String("[OK] ") + cmd);
+      return;
+    }
+  }
+  Serial.println(String("[ERR] ") + cmd);
+}
+
+void setupGSM() {
+  sendAT("AT", "OK");
+  sendAT("ATE0", "OK");
+  sendAT("AT+CPIN?", "READY");
+  sendAT("AT+CSQ", "OK");
+  sendAT("AT+CREG?", "0,1");
+  sendAT("AT+CGATT=1", "OK");
+
+  String cmd = "AT+CGDCONT=1,\"IP\",\"" + String(apn) + "\"";
+  sendAT(cmd.c_str(), "OK");
+
+  sendAT("AT+CSOCKSETPN=1", "OK");
+  sendAT("AT+NETOPEN", "OK", 10000);
+  delay(2000);
+}
+
+void connectTCP() {
+  sendAT("AT+CIPCLOSE=0", "OK", 3000); // Close old socket if any
+  sendAT("AT+NETCLOSE", "OK", 5000);   // Close network
+  delay(1000);
+  sendAT("AT+NETOPEN", "OK", 10000);   // Reopen network
+  delay(1000);
+
+  String cmd = "AT+CIPOPEN=0,\"TCP\",\"" + String(mqttServer) + "\"," + String(mqttPort);
+  sendAT(cmd.c_str(), "OK", 10000);
+  delay(2000);
+}
+
+void mqttConnect() {
+  uint8_t connectPacket[128];
+  int pos = 0;
+
+  connectPacket[pos++] = 0x10;
+  uint8_t remLen = 10 + 2 + strlen(mqttClientID) + 2 + strlen(mqttUser) + 2 + strlen(mqttPassword);
+  connectPacket[pos++] = remLen;
+
+  connectPacket[pos++] = 0x00; connectPacket[pos++] = 0x04;
+  connectPacket[pos++] = 'M'; connectPacket[pos++] = 'Q'; connectPacket[pos++] = 'T'; connectPacket[pos++] = 'T';
+  connectPacket[pos++] = 0x04;
+  connectPacket[pos++] = 0xC2;
+  connectPacket[pos++] = 0x00; connectPacket[pos++] = 60;
+
+  connectPacket[pos++] = 0x00;
+  connectPacket[pos++] = strlen(mqttClientID);
+  memcpy(&connectPacket[pos], mqttClientID, strlen(mqttClientID));
+  pos += strlen(mqttClientID);
+
+  connectPacket[pos++] = 0x00;
+  connectPacket[pos++] = strlen(mqttUser);
+  memcpy(&connectPacket[pos], mqttUser, strlen(mqttUser));
+  pos += strlen(mqttUser);
+
+  connectPacket[pos++] = 0x00;
+  connectPacket[pos++] = strlen(mqttPassword);
+  memcpy(&connectPacket[pos], mqttPassword, strlen(mqttPassword));
+  pos += strlen(mqttPassword);
+
+  String cmd = "AT+CIPSEND=0," + String(pos);
+  sendAT(cmd.c_str(), ">", 3000);
+  gsmSerial.write(connectPacket, pos);
+  delay(2000);
+}
+
+void mqttPublish(const char* topic, const char* payload) {
+  int topicLength = strlen(topic);
+  int payloadLength = strlen(payload);
+  int remLen = 2 + topicLength + payloadLength;
+
+  uint8_t packet[256];
+  int pos = 0;
+
+  packet[pos++] = 0x30;
+  packet[pos++] = remLen;
+
+  packet[pos++] = (topicLength >> 8) & 0xFF;
+  packet[pos++] = topicLength & 0xFF;
+  memcpy(&packet[pos], topic, topicLength);
+  pos += topicLength;
+
+  memcpy(&packet[pos], payload, payloadLength);
+  pos += payloadLength;
+
+  String cmd = "AT+CIPSEND=0," + String(pos);
+  sendAT(cmd.c_str(), ">", 3000);
+  gsmSerial.write(packet, pos);
+  delay(2000);
+}
+
+void closeConnection() {
+  sendAT("AT+CIPCLOSE=0", "OK", 5000);
+  sendAT("AT+NETCLOSE", "OK", 5000);
+  delay(1000);
+}
+
+void setup() {
+  Serial.begin(9600);
+  gsmSerial.begin(115200);
+  Serial.println("Initializing SIM7600E...");
+  setupGSM();
+}
+
+void loop() {
+  float t = 25.3;
+  float h = 55.8;
+
+  String payload = "{\"temperature\":" + String(t, 1) + ",\"humidity\":" + String(h, 1) + "}";
+  Serial.println("Connecting to MQTT broker...");
+  connectTCP();
+  mqttConnect();
+  mqttPublish(mqttTopic, payload.c_str());
+
+  closeConnection();
+
+  Serial.println("Data sent. Waiting for next cycle...");
+  delay(interval); // 5 minutes
+}
